@@ -18,13 +18,13 @@
 
 using namespace std;
 
-#define HOST "192.168.2.1"
+#define HOST "192.168.30.80"
 #define LISTEN_PORT "5876"
 #define MAXEVENTS 64
 #define BUFSIZE 2048
 
 enum event_type {
-    TUN, NEW, DATA
+    TUN, LISTNER, PEER
 };
 
 typedef struct peer_t{
@@ -81,58 +81,10 @@ void register_signals() {
         cout << "Not able to register SIGNALS (SIGSEGV)" << endl;
 }
 
-static int get_socket_and_bind(const char *host, const char *port,
-                               struct addrinfo *inf_addr){
-    struct addrinfo hints = {};
-    struct addrinfo *result, *rp;
-    int s, sfd = -1;
-
-    std::cout << "Creating and Binding Socket" << std::endl;
-
-    memset(&hints, 0, sizeof hints);
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_DGRAM;
-    hints.ai_flags = AI_PASSIVE; // use my IP address
-
-    s = getaddrinfo (host, port, &hints, &result);
-    if (s != 0)
-    {
-        fprintf (stderr, "getaddrinfo: %s\n", gai_strerror (s));
-        return -1;
-    }
-
-    for (rp = result; rp != nullptr; rp = rp->ai_next)
-    {
-        sfd = socket (rp->ai_family, rp->ai_socktype, rp->ai_protocol);
-        if (sfd == -1)
-            continue;
-
-        s = bind (sfd, rp->ai_addr, rp->ai_addrlen);
-        if (s == 0)
-        {
-            int on = 1;
-            if (setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (char *)&on, sizeof(on)) < 0) {
-                perror("setsockopt");
-                close(sfd);
-                return -1;
-            }
-            /* We managed to bind successfully! */
-            memcpy(inf_addr, rp, sizeof(struct addrinfo));
-            break;
-        }
-
-        close (sfd);
-    }
-
-    if (rp == nullptr)
-    {
-        fprintf (stderr, "Could not bind\n");
-        return -1;
-    }
-
-    freeaddrinfo (result);
-
-    return sfd;
+static socklen_t get_address_len(const sockaddr* address) {
+    if(address->sa_family == AF_INET) return sizeof(struct sockaddr_in);
+    else if(address->sa_family == AF_INET6) return sizeof(struct sockaddr_in6);
+    return 0;
 }
 
 static int make_socket_non_blocking (int sfd) {
@@ -156,6 +108,66 @@ static int make_socket_non_blocking (int sfd) {
     return 0;
 }
 
+static int get_socket_and_bind(const char *host, const char *port,
+                               struct addrinfo *inf_addr){
+    struct addrinfo hints = {};
+    struct addrinfo *result, *rp;
+    int s, sfd = -1;
+
+    std::cout << "Creating and Binding Socket" << std::endl;
+
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = AI_PASSIVE; // use my IP address
+
+    s = getaddrinfo (host, port, &hints, &result);
+    if (s != 0)
+    {
+        fprintf (stderr, "Could not getaddrinfo: %s\n", gai_strerror (s));
+        return -1;
+    }
+
+    for (rp = result; rp != nullptr; rp = rp->ai_next)
+    {
+        int on = 1;
+        sfd = socket (rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (sfd == -1) {
+            perror("create socket()");
+            continue;
+        }
+
+        if(make_socket_non_blocking(conf.server.fd) < 0){
+            perror( "Could make socket non blocking");
+        }
+
+        if (setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (char *)&on, sizeof(on)) < 0) {
+            perror("setsockopt");
+            continue;
+        }
+
+        s = bind (sfd, rp->ai_addr, rp->ai_addrlen);
+        if (s == 0)
+        {
+            /* We managed to bind successfully! */
+            memcpy(inf_addr, rp, sizeof(struct addrinfo));
+            break;
+        }
+
+        close (sfd);
+    }
+
+    if (rp == nullptr)
+    {
+        fprintf (stderr, "Could not bind\n");
+        return -1;
+    }
+
+    freeaddrinfo (result);
+
+    return sfd;
+}
+
 int main() {
     int s, nevent;
     struct epoll_event event = {};
@@ -166,7 +178,7 @@ int main() {
     register_signals();
 
     conf.server.fd = get_socket_and_bind(
-            nullptr, LISTEN_PORT,
+            HOST, LISTEN_PORT,
             &conf.server.inf_addr
     );
     if(conf.server.fd < 0){
@@ -174,10 +186,6 @@ int main() {
     }
     cout << "socket " << conf.server.fd <<" bind at "
                       << inet_ntoa(((struct sockaddr_in*)conf.server.inf_addr.ai_addr)->sin_addr) << endl;
-
-    if(make_socket_non_blocking(conf.server.fd) < 0){
-        perror( "Could make socket non blocking");
-    }
 
     conf.efd = epoll_create1 (0);
     if (conf.efd == -1){
@@ -187,7 +195,7 @@ int main() {
 
 
     context_t server_ctx = {};
-    server_ctx.etype = NEW;
+    server_ctx.etype = LISTNER;
     server_ctx.fd = conf.server.fd;
     server_ctx.ptr = &conf.server;
 
@@ -214,7 +222,7 @@ int main() {
                 /* An error has occured on this fd, or the socket is not
                    ready for reading (why were we notified then?) */
                 perror("epoll error");
-                if(ctx->etype == NEW) {
+                if(ctx->etype == LISTNER) {
                     break;
                 }else{
                     close(ctx->fd);
@@ -223,37 +231,54 @@ int main() {
             }
 
             if((events[i].events & EPOLLIN)){
-                if(ctx->etype == NEW){
+                if(ctx->etype == LISTNER){
+                    int optval = 1;
                     char buffer[BUFSIZE];
+                    struct sockaddr local_addr, peer_addr;
+                    socklen_t peer_addrLen, local_addrLen;
 
-                    auto * server = static_cast<server_t *>(ctx->ptr);
-                    auto r = static_cast<int>(recvfrom(ctx->fd, buffer, BUFSIZE,
-                                                      0, &conf.peer.addr, &conf.peer.addrlen));
+                    getsockname(ctx->fd, &local_addr, &local_addrLen);
+                    peer_addr.sa_family = local_addr.sa_family;
+                    peer_addrLen = get_address_len(&peer_addr);
 
-                    cout << "received " << r << " bytes" << endl;
+                    int r = (int) (recvfrom(ctx->fd, buffer, BUFSIZE,
+                                                       MSG_DONTWAIT, &peer_addr, &peer_addrLen));
+
+                    cout << "received " << r << " bytes from listener" << endl;
                     if(r > 0){
-                        if((conf.peer.fd = socket(
-                                server->inf_addr.ai_family,
-                                server->inf_addr.ai_socktype,
-                                server->inf_addr.ai_protocol) < 0)){
+
+                        conf.peer.fd = socket(local_addr.sa_family, SOCK_DGRAM, 0);
+                        if(conf.peer.fd < 0){
                             perror("peer socket()");
                             continue;
                         }
 
-                        if(bind(conf.peer.fd, server->inf_addr.ai_addr, server->inf_addr.ai_addrlen) < 0){
-                            perror("peer bind()");
-//                            close(conf.peer.fd);
-//                            continue;
+                        make_socket_non_blocking(conf.peer.fd);
+
+                        if (setsockopt(conf.peer.fd, SOL_SOCKET, SO_REUSEADDR, (char *) &optval, sizeof(optval)) < 0) {
+                            perror("setsockopt() set SO_REUSEADDR");
+                            close(conf.peer.fd);
+                            continue;
                         }
 
-                        if(connect(conf.peer.fd,&conf.peer.addr,conf.peer.addrlen) < 0){
-                            perror("peer connect()");
-//                            close(conf.peer.fd);
-//                            continue;
+                        if(bind(conf.peer.fd, &local_addr, local_addrLen) < 0){
+                            perror("peer bind()");
+                            close(conf.peer.fd);
+                            continue;
                         }
+
+                        if(connect(conf.peer.fd, &peer_addr, peer_addrLen) < 0){
+                            perror("peer connect()");
+                            close(conf.peer.fd);
+                            continue;
+                        }
+
+                        conf.peer.addr.sa_family = peer_addr.sa_family;
+                        memcpy(&conf.peer.addr, &peer_addr, peer_addrLen);
+                        conf.peer.addrlen = peer_addrLen;
 
                         context_t peer_ctx = {};
-                        peer_ctx.etype = DATA;
+                        peer_ctx.etype = PEER;
                         peer_ctx.fd = conf.peer.fd;
                         peer_ctx.ptr = &conf.peer;
 
@@ -267,16 +292,19 @@ int main() {
 
                         cout << "new connection from "
                                 << inet_ntoa(((struct sockaddr_in*)&conf.peer.addr)->sin_addr)
-                                        << endl;
+                                << ":" << ntohs(((struct sockaddr_in*)&conf.peer.addr)->sin_port)
+                                << endl;
                     }
                 }
 
-                if(ctx->etype == DATA){
+                if(ctx->etype == PEER){
                     char buffer[BUFSIZE];
                     auto * peer = static_cast<peer_t *>(ctx->ptr);
                     auto r = (int) recv(peer->fd, buffer, BUFSIZE, 0);
                     cout << "received " << r << " bytes from "
-                            << inet_ntoa(((struct sockaddr_in*)&peer->addr)->sin_addr) << endl;
+                            << inet_ntoa(((struct sockaddr_in*)&peer->addr)->sin_addr)
+                            << ":" << ntohs(((struct sockaddr_in*)&peer->addr)->sin_port)
+                            << endl;
                 }
             }
         }
