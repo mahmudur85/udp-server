@@ -21,7 +21,7 @@ using namespace std;
 #define HOST "192.168.30.80"
 #define LISTEN_PORT "5876"
 #define MAXEVENTS 64
-#define BUFSIZE 2048
+#define BUFSIZE 1400
 
 enum event_type {
     TUN, LISTNER, PEER
@@ -137,10 +137,6 @@ static int get_socket_and_bind(const char *host, const char *port,
             continue;
         }
 
-        if(make_socket_non_blocking(conf.server.fd) < 0){
-            perror( "Could make socket non blocking");
-        }
-
         if (setsockopt(sfd, SOL_SOCKET, SO_REUSEADDR, (char *)&on, sizeof(on)) < 0) {
             perror("setsockopt");
             continue;
@@ -172,6 +168,7 @@ int main() {
     int s, nevent;
     struct epoll_event event = {};
     struct epoll_event *events;
+    bool running = true;
 
     std::cout << "Initializing Server" << std::endl;
 
@@ -183,9 +180,20 @@ int main() {
     );
     if(conf.server.fd < 0){
         perror("Could create socket");
+        abort ();
     }
+
     cout << "socket " << conf.server.fd <<" bind at "
-                      << inet_ntoa(((struct sockaddr_in*)conf.server.inf_addr.ai_addr)->sin_addr) << endl;
+                      << inet_ntoa(((struct sockaddr_in*)conf.server.inf_addr.ai_addr)->sin_addr)
+                              << ":" << LISTEN_PORT
+                              << endl;
+
+
+    if(make_socket_non_blocking(conf.server.fd) < 0){
+        perror( "Could make socket non blocking");
+        close(conf.server.fd);
+        abort ();
+    }
 
     conf.efd = epoll_create1 (0);
     if (conf.efd == -1){
@@ -210,8 +218,14 @@ int main() {
     /* Buffer where events are returned */
     events = (struct epoll_event *) calloc (MAXEVENTS, sizeof(epoll_event));
 
-    while ((nevent = epoll_wait (conf.efd, events, MAXEVENTS, -1)) > 0){
+    while (running){
         int i;
+
+        do {
+            nevent = epoll_wait(conf.efd, events, MAXEVENTS, -1);
+        }while (nevent == -1 && errno == EINTR);
+
+        cout << endl << "server event count: " << nevent << endl;
 
         for (i = 0; i < nevent; i++){
             auto *ctx = static_cast<context_t *>(events[i].data.ptr);
@@ -223,37 +237,50 @@ int main() {
                    ready for reading (why were we notified then?) */
                 perror("epoll error");
                 if(ctx->etype == LISTNER) {
+                    running = false;
                     break;
                 }else{
                     close(ctx->fd);
                 }
                 continue;
             }
+            if(ctx->etype == LISTNER){
+                int optval = 1;
+                char buffer[BUFSIZE];
+                struct sockaddr peer_addr;
+                socklen_t peer_addrLen;
 
-            if((events[i].events & EPOLLIN)){
-                if(ctx->etype == LISTNER){
-                    int optval = 1;
-                    char buffer[BUFSIZE];
-                    struct sockaddr local_addr, peer_addr;
-                    socklen_t peer_addrLen, local_addrLen;
+                auto *server = static_cast<server_t *>(ctx->ptr);
 
-                    getsockname(ctx->fd, &local_addr, &local_addrLen);
-                    peer_addr.sa_family = local_addr.sa_family;
-                    peer_addrLen = get_address_len(&peer_addr);
+                peer_addr.sa_family = server->inf_addr.ai_addr->sa_family;
+                peer_addrLen = get_address_len(&peer_addr);
 
-                    int r = (int) (recvfrom(ctx->fd, buffer, BUFSIZE,
-                                                       MSG_DONTWAIT, &peer_addr, &peer_addrLen));
+                while(true) {
+                    int r = (int) recvfrom(ctx->fd, buffer, BUFSIZE,
+                                           MSG_DONTWAIT, &peer_addr, &peer_addrLen);
 
-                    cout << "received " << r << " bytes from listener" << endl;
-                    if(r > 0){
+                    if(r == -1){
+                        if ((errno == EAGAIN) ||
+                            (errno == EWOULDBLOCK)){
+                            /* We have processed all incoming connections. */
+                            cout << "processed all incoming connections." << endl;
+                        }else{
+                            perror ("recvfrom() error!");
+                        }
+                        break;
+                    }
+                    if (r > 0) {
+                        cout << "received " << r << " bytes from "
+                             << inet_ntoa(((struct sockaddr_in *) &peer_addr)->sin_addr)
+                             << ":" << ntohs(((struct sockaddr_in *) &peer_addr)->sin_port)
+                             << " (new)"
+                             << endl;
 
-                        conf.peer.fd = socket(local_addr.sa_family, SOCK_DGRAM, 0);
-                        if(conf.peer.fd < 0){
+                        conf.peer.fd = socket(server->inf_addr.ai_family, server->inf_addr.ai_socktype, server->inf_addr.ai_protocol);
+                        if (conf.peer.fd < 0) {
                             perror("peer socket()");
                             continue;
                         }
-
-                        make_socket_non_blocking(conf.peer.fd);
 
                         if (setsockopt(conf.peer.fd, SOL_SOCKET, SO_REUSEADDR, (char *) &optval, sizeof(optval)) < 0) {
                             perror("setsockopt() set SO_REUSEADDR");
@@ -261,14 +288,21 @@ int main() {
                             continue;
                         }
 
-                        if(bind(conf.peer.fd, &local_addr, local_addrLen) < 0){
+                        if (bind(conf.peer.fd, server->inf_addr.ai_addr, server->inf_addr.ai_addrlen) < 0) {
                             perror("peer bind()");
                             close(conf.peer.fd);
                             continue;
                         }
 
-                        if(connect(conf.peer.fd, &peer_addr, peer_addrLen) < 0){
+                        if (connect(conf.peer.fd, &peer_addr, peer_addrLen) < 0) {
                             perror("peer connect()");
+                            close(conf.peer.fd);
+                            continue;
+                        }
+
+                        make_socket_non_blocking(conf.peer.fd);
+                        if(make_socket_non_blocking(conf.peer.fd) < 0){
+                            perror( "Could make socket non blocking");
                             close(conf.peer.fd);
                             continue;
                         }
@@ -285,26 +319,37 @@ int main() {
                         event.data.ptr = &peer_ctx;
                         event.events = EPOLLIN | EPOLLET;
 
-                        if(epoll_ctl (conf.efd, EPOLL_CTL_ADD, conf.peer.fd, &event) < 0){
-                            perror ("peer epoll_ctl()");
+                        if (epoll_ctl(conf.efd, EPOLL_CTL_ADD, conf.peer.fd, &event) < 0) {
+                            perror("peer epoll_ctl()");
                             close(conf.peer.fd);
                         }
-
-                        cout << "new connection from "
-                                << inet_ntoa(((struct sockaddr_in*)&conf.peer.addr)->sin_addr)
-                                << ":" << ntohs(((struct sockaddr_in*)&conf.peer.addr)->sin_port)
-                                << endl;
                     }
                 }
+            }
 
-                if(ctx->etype == PEER){
-                    char buffer[BUFSIZE];
-                    auto * peer = static_cast<peer_t *>(ctx->ptr);
-                    auto r = (int) recv(peer->fd, buffer, BUFSIZE, 0);
-                    cout << "received " << r << " bytes from "
-                            << inet_ntoa(((struct sockaddr_in*)&peer->addr)->sin_addr)
-                            << ":" << ntohs(((struct sockaddr_in*)&peer->addr)->sin_port)
-                            << endl;
+            if(ctx->etype == PEER){
+                char buffer[BUFSIZE];
+                auto * peer = static_cast<peer_t *>(ctx->ptr);
+                while(true) {
+                    auto r = (int) recv(peer->fd, buffer, BUFSIZE, MSG_DONTWAIT);
+                    if(r == -1){
+                        if ((errno == EAGAIN) ||
+                            (errno == EWOULDBLOCK)){
+                            /* We have processed all incoming packets. */
+                            cout << "processed all incoming packets." << endl;
+                            break;
+                        }else{
+                            perror ("recv() error!");
+                            close(ctx->fd);
+                            break;
+                        }
+                    }
+                    if(r > 0) {
+                        cout << "received " << r << " bytes from "
+                             << inet_ntoa(((struct sockaddr_in *) &peer->addr)->sin_addr)
+                             << ":" << ntohs(((struct sockaddr_in *) &peer->addr)->sin_port)
+                             << endl;
+                    }
                 }
             }
         }
