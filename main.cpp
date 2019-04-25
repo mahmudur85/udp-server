@@ -227,6 +227,7 @@ int main() {
 
         cout << endl << "server event count: " << nevent << endl;
 
+
         for (i = 0; i < nevent; i++){
             auto *ctx = static_cast<context_t *>(events[i].data.ptr);
 
@@ -300,7 +301,6 @@ int main() {
                             continue;
                         }
 
-                        make_socket_non_blocking(conf.peer.fd);
                         if(make_socket_non_blocking(conf.peer.fd) < 0){
                             perror( "Could make socket non blocking");
                             close(conf.peer.fd);
@@ -323,6 +323,8 @@ int main() {
                             perror("peer epoll_ctl()");
                             close(conf.peer.fd);
                         }
+
+                        send(conf.peer.fd, buffer, (size_t)r, MSG_DONTWAIT);
                     }
                 }
             }
@@ -337,18 +339,18 @@ int main() {
                             (errno == EWOULDBLOCK)){
                             /* We have processed all incoming packets. */
                             cout << "processed all incoming packets." << endl;
-                            break;
                         }else{
                             perror ("recv() error!");
                             close(ctx->fd);
-                            break;
                         }
+                        break;
                     }
                     if(r > 0) {
                         cout << "received " << r << " bytes from "
                              << inet_ntoa(((struct sockaddr_in *) &peer->addr)->sin_addr)
                              << ":" << ntohs(((struct sockaddr_in *) &peer->addr)->sin_port)
                              << endl;
+                        send(peer->fd, buffer, (size_t)r, MSG_DONTWAIT);
                     }
                 }
             }
